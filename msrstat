@@ -1,0 +1,241 @@
+#!/usr/bin/ruby
+# Obeserve per CPU performance statistics via MSR
+# (c) 2014 <abc@telekom.ru>
+# License: GPL.
+
+require 'getoptlong'
+
+@interval = 5
+
+def check_user_perms
+  if Process.uid != 0 &&
+    !File.readable?("/dev/cpu/0/msr") &&
+    !File.writable?("/dev/cpu/0/msr")
+    $stderr.puts "Root is required to access MSR device."
+    exit 1
+  end
+end
+
+GetoptLong.new(
+      ["--help",     "-h", GetoptLong::NO_ARGUMENT],
+).each do |opt, arg|
+    case opt
+    when '--help'
+      puts " Show CPU load statistis via hardware Performance Counters."
+      puts " Legend:"
+      puts "  freq%    Frequency scaling: IA32_APERF / IA32_MPERF * 100"
+      puts "  busy%    CPU busy time: CPU_CLK_UNHALTED.CORE / IA32_TIME_STAMP_COUNTER * 100"
+      puts "  stalls%  Stalled cycles: RESOURCE_STALLS.ANY, CPU_CLK_UNHALTED.CORE * 100"
+      puts "  CPI_wb   Cycles Per Instruction while busy: CPU_CLK_UNHALTED.CORE / INST_RETIRED.ANY"
+      check_user_perms
+      exit 0
+    end
+end
+if ARGV[0].to_i > 0
+  @interval = ARGV[0].to_i
+end
+
+check_user_perms
+unless File.exist?("/dev/cpu/0/cpuid")
+  system 'modprobe -q cpuid'
+  # can work w/o cpuid using defaults
+end
+unless File.exist?("/dev/cpu/0/msr")
+  unless system 'modprobe msr'
+    $stderr.puts "'modprobe msr' is failed, try to"
+    $stderr.print "enable CONFIG_X86_MSR"
+    unless File.exist?("/dev/cpu/0/cpuid")
+      $stderr.print " and CONFIG_X86_CPUID"
+    end
+    $stderr.puts " in kernel."
+  end
+end
+unless File.exist?("/dev/cpu/0/msr")
+  $stderr.puts "No MSR device '/dev/cpu/0/msr'."
+  exit 1
+end
+unless File.readable?("/dev/cpu/0/msr") && File.writable?("/dev/cpu/0/msr")
+  $stderr.puts "No access to MSR device '/dev/cpu/0/msr'."
+  exit 1
+end
+
+class Integer
+  def bits(r)
+    r = r..r unless r.kind_of? Range
+    (self >> r.min) & ((1 << (1 + r.max - r.min)) - 1)
+  end
+end
+# defaults
+@pmc_nr = 2
+@pmc_size = 48
+@ctr_nr = 3
+@ctr_size = @pmc_size
+def cpuid_dev
+  File.open("/dev/cpu/0/cpuid", "r") do |f|
+    f.seek(0x0000001) # Version Information
+    version = f.read(16).unpack('LLLL')
+    f.seek(0x000000a) # Architectural Performance Monitoring leaf
+    perf = f.read(16).unpack('LLLL')
+    @perf_ver 	= perf[0].bits(0..7)
+    @pmc_nr	= perf[0].bits(8..15)
+    @pmc_size	= perf[0].bits(16..23)
+    @ctr_nr	= perf[3].bits(0..4)
+    @ctr_size	= perf[3].bits(5..12)
+    @model	= version[0].bits(4..7)
+    @family	= version[0].bits(8..11)
+    ext_model	= version[0].bits(16..19)
+    ext_family	= version[0].bits(20..27)
+    if @family == 0x0f || @family == 0x06
+      @model += ext_model << 4
+    end
+    @family += ext_family if @family == 0x0f
+  end
+end
+def cpuid_proc
+  File.open("/proc/cpuinfo", "r") do |f|
+    f.each do |li|
+      if li =~ /^cpu family\s+:\s+(\d+)/
+        @family = $1.to_i
+      elsif li =~ /^model\s+:\s+(\d+)/
+        @model = $1.to_i
+      end
+      break if @family && @model
+    end
+  end
+end
+begin
+  cpuid_dev
+rescue Errno::ENOENT
+  cpuid_proc
+end
+@pmc_max = 1 << @pmc_size
+@ctr_max = 1 << @ctr_size
+
+puts "PERF ID %d, PMC[%d] w%d, CTR[%d] w%d, DisplayFamily_DisplayModel %02X_%02XH" % [
+  @perf_ver.to_i,
+  @pmc_nr.to_i, @pmc_size.to_i,
+  @ctr_nr.to_i, @ctr_size.to_i,
+  @family, @model
+]
+
+# cpu dependent constants
+IA32_TIME_STAMP_COUNTER	= 0x0010
+IA32_PMC0		= 0x00c1
+IA32_PMC1		= 0x00c2
+IA32_PMC2		= 0x00c3
+IA32_PMC3		= 0x00c4
+IA32_MPERF		= 0x00e7 # TSC Frequency Clock Counter
+IA32_APERF		= 0x00e8 # Actual Performance Clock Counter
+IA32_PERFEVTSEL0	= 0x0186
+IA32_PERFEVTSEL1	= 0x0187
+IA32_PERFEVTSEL2	= 0x0188
+IA32_PERFEVTSEL3	= 0x0189
+
+IA32_FIXED_CTR0		= 0x0309 # INST_RETIRED.ANY
+IA32_FIXED_CTR1		= 0x030a # CPU_CLK_UNHALTED.CORE
+IA32_FIXED_CTR2		= 0x030b # CPU_CLK_UNHALTED.REF
+IA32_FIXED_CTR_CTRL	= 0x038d
+
+if @family == 0x06 && @model == 0x17 # Core
+  PERF_RESOURCE_STALLS_ANY	= 0x1fdc
+else
+  # on all rest it seems to be at the same place
+  PERF_RESOURCE_STALLS_ANY	= 0x01a2
+end
+
+@rd = []
+@wr = []
+def rdmsr(addr, cpu = nil)
+  if cpu
+    @rd[cpu] ||= File.open("/dev/cpu/#{cpu}/msr", 'r')
+    @rd[cpu].sysseek(addr)
+    @rd[cpu].sysread(8).unpack('Q').first rescue 0
+  else
+    (0...nrcpu).to_a.map {|c| rdmsr(addr, c)}
+  end
+end
+def wrmsr(addr, val, cpu = nil)
+  if cpu
+    @wr[cpu] ||= File.open("/dev/cpu/#{cpu}/msr", 'w')
+    @wr[cpu].sysseek(addr)
+    @wr[cpu].syswrite([val].pack('Q'))
+  else
+    (0...nrcpu).to_a.map {|c| wrmsr(addr, val, c)}
+  end
+end
+def nrcpu
+  @nrcpu ||= Dir.glob("/dev/cpu/*").grep(/\/\d+$/).size
+end
+class Array
+  def csub(older, wmax = 0)
+    self.zip(older).map do |a,b|
+      (a >= b)? a - b : wmax + a - b
+    end
+  end
+  def div(other)
+    self.zip(other).map {|a,b| a.to_f / b.to_f rescue 0}
+  end
+  def mul(m)
+    self.map{|e| e * m}
+  end
+end
+
+@msr = Hash.new {|h,k| h[k] = Hash.new}
+# read msr into array with automatic history value
+def rdmsra(addr, ts = nil)
+  newvals = rdmsr(addr)
+  oldvals = @msr[addr][:o] = @msr[addr][:n]
+  @msr[addr][:n] = newvals
+  @msr[addr][:to] = @msr[addr][:tn]
+  @msr[addr][:tn] = @now
+  if @msr[addr][:to]
+    @msr[addr][:td] = @msr[addr][:tn] - @msr[addr][:to]
+    @msr[addr][:r] = newvals.csub(oldvals, @pmc_max)
+  end
+end
+def msrdiv(a, b)
+  @msr[a][:r].div(@msr[b][:r])
+end
+def msr_print(t, a, b, m = 1)
+  d = msrdiv(a, b)
+  d = d.mul(m) if m != 1
+  puts ("%-7s" % t) + d.map {|e| " %6.2f" % e}.join
+end
+
+# program perf counters
+wrmsr(IA32_FIXED_CTR_CTRL, 0x333)
+INST_RETIRED_ANY	= IA32_FIXED_CTR0
+CPU_CLK_UNHALTED_CORE	= IA32_FIXED_CTR1
+CPU_CLK_UNHALTED_REF	= IA32_FIXED_CTR2
+wrmsr(IA32_PERFEVTSEL0, 0x430000 | PERF_RESOURCE_STALLS_ANY)
+RESOURCE_STALLS_ANY     = IA32_PMC0
+
+begin
+loop do
+  @now = Time.now
+  rdmsra(IA32_APERF)
+  rdmsra(IA32_MPERF)
+  rdmsra(IA32_TIME_STAMP_COUNTER)
+  rdmsra(CPU_CLK_UNHALTED_CORE)
+  rdmsra(INST_RETIRED_ANY)
+  rdmsra(RESOURCE_STALLS_ANY)
+  unless @notfirst
+    @notfirst = true
+    sleep 0.5
+    next
+  end
+
+  puts
+  puts @now.strftime('-%H:%M- ') + (0...nrcpu).to_a.map {|e| " cpu%-3d" % e}.join
+  msr_print("freq%", IA32_APERF, IA32_MPERF, 100)
+  msr_print("busy%", CPU_CLK_UNHALTED_CORE, IA32_TIME_STAMP_COUNTER, 100)
+  msr_print("CPI_wb", CPU_CLK_UNHALTED_CORE, INST_RETIRED_ANY)
+  msr_print("stalls%", RESOURCE_STALLS_ANY, CPU_CLK_UNHALTED_CORE, 100)
+
+  sleep @interval
+end
+ensure
+  # stop them
+  wrmsr(IA32_FIXED_CTR_CTRL, 0)
+  wrmsr(IA32_PERFEVTSEL0, 0)
+end
