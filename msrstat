@@ -27,6 +27,7 @@ GetoptLong.new(
       puts " Legend:"
       puts "  freq%    Frequency scaling: IA32_APERF / IA32_MPERF * 100"
       puts "  busy%    CPU busy time: CPU_CLK_UNHALTED.CORE / IA32_TIME_STAMP_COUNTER * 100"
+      puts "  osbusy%  CPU busy time as reported by kernel (from /proc/stat)."
       puts "  stalls%  Stalled cycles: RESOURCE_STALLS.ANY, CPU_CLK_UNHALTED.CORE * 100"
       puts "  CPI_wb   Cycles Per Instruction while busy: CPU_CLK_UNHALTED.CORE / INST_RETIRED.ANY"
       check_user_perms
