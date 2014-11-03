@@ -177,6 +177,9 @@ class Array
       (a >= b)? a - b : wmax + a - b
     end
   end
+  def divscalar(val)
+    self.map {|a| a.to_f / val rescue 0}
+  end
   def div(other)
     self.zip(other).map {|a,b| a.to_f / b.to_f rescue 0}
   end
@@ -188,13 +191,13 @@ end
 @cs = Hash.new {|h,k| h[k] = Hash.new}
 def stat_rotate(key, newvals, shift = 0)
   oldvals = @cs[key][:o] = @cs[key][:n]
+  @cs[key][:to] = @cs[key][:tn]
   @cs[key][:n] = newvals
+  @cs[key][:tn] = @now
   if oldvals
+    @cs[key][:d] = @cs[key][:tn] - @cs[key][:to]
     @cs[key][:r] = newvals.csub(oldvals, shift)
   end
-end
-def stat_div(a, b)
-  @cs[a][:r].div(@cs[b][:r])
 end
 # colorize hard
 def colorize(schema, t, val)
@@ -211,11 +214,17 @@ def colorize(schema, t, val)
   "#{c}#{t}#{u}"
 end
 
-def stat_print(t, col, a, b, m = 1)
-  d = stat_div(a, b)
+def stat_print(t, schema, a, b = nil, m = 1)
+  if b
+    d = @cs[a][:r].div(@cs[b][:r])
+  else
+    d = @cs[a][:r].divscalar(@cs[a][:d])
+  end
   d = d.mul(m) if m != 1
+  fmt = " %6.2f"
+  fmt = " %6d" if schema == :rate
   puts ("%-7s" % t) + (d.map do |e|
-    colorize(col, " %6.2f" % e, e)
+    colorize(schema, fmt % e, e)
   end.join)
 end
 
@@ -242,6 +251,27 @@ def proc_stat
   stat_rotate(:total, total)
 end
 
+def read_irqtable(file)
+  total = []
+  net = []
+  lines = IO.readlines(file)
+  lines[2..-1].each do |li|
+    irq, stat, desc = li.match(/^\s*(\S+):((?:\s+\d+)+)(.*)$/).captures
+    stat = stat.scan(/\d+/).map{|e| e.to_i}
+    stat.each_with_index do |v, c|
+      total[c] ||= 0
+      total[c] += v
+      net[c] ||= 0
+      net[c] += v if desc =~ /\beth/
+    end
+  end
+  stat_rotate(:irqs, total)
+  stat_rotate(:irqnet, net)
+end
+def proc_interrupts
+  read_irqtable "/proc/interrupts"
+end
+
 # program perf counters
 wrmsr(IA32_FIXED_CTR_CTRL, 0x333)
 INST_RETIRED_ANY	= IA32_FIXED_CTR0
@@ -254,6 +284,7 @@ begin
 loop do
   @now = Time.now
   proc_stat
+  proc_interrupts
   rdmsra(IA32_APERF)
   rdmsra(IA32_MPERF)
   rdmsra(IA32_TIME_STAMP_COUNTER)
@@ -271,6 +302,8 @@ loop do
   stat_print("freq%",   :freq,   IA32_APERF, IA32_MPERF, 100)
   stat_print("busy%",   :busy,   CPU_CLK_UNHALTED_CORE, IA32_TIME_STAMP_COUNTER, 100)
   stat_print("osbusy%", :busy,   :busy, :total, 100)
+  stat_print("irqs",    :rate,   :irqs)
+  stat_print("netirqs", :rate,   :irqnet)
   stat_print("stalls%", :stalls, RESOURCE_STALLS_ANY, CPU_CLK_UNHALTED_CORE, 100)
   stat_print("CPI_wb",  :cpi,    CPU_CLK_UNHALTED_CORE, INST_RETIRED_ANY)
 
