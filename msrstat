@@ -288,6 +288,8 @@ CPU_CLK_UNHALTED_REF	= IA32_FIXED_CTR2
 wrmsr(IA32_PERFEVTSEL0, 0x430000 | PERF_RESOURCE_STALLS_ANY)
 RESOURCE_STALLS_ANY     = IA32_PMC0
 
+hostname = `hostname -s`.strip
+
 begin
 loop do
   @now = Time.now
@@ -306,7 +308,7 @@ loop do
   end
 
   puts
-  puts @now.strftime('-%H:%M- ') + (0...nrcpu).to_a.map {|e| " cpu%-3d" % e}.join
+  puts @now.strftime('-%H:%M- ') + (0...nrcpu).to_a.map {|e| " cpu%-3d" % e}.join + ":#{hostname}"
   stat_print("freq%",   :freq,   IA32_APERF, IA32_MPERF, 100)
   stat_print("busy%",   :busy,   CPU_CLK_UNHALTED_CORE, IA32_TIME_STAMP_COUNTER, 100)
   stat_print("osbusy%", :busy,   :busy, :total, 100)
