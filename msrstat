@@ -224,6 +224,14 @@ def stat_print(t, schema, a, b = nil, m = 1)
   fmt = " %6.2f"
   fmt = " %6d" if schema == :rate
   puts ("%-7s" % t) + (d.map do |e|
+    if schema == :xrate
+      fmt = " %5.1f%c"
+      if   e > 1e12; e = [e /= 1e12, 'T']
+      elsif e > 1e9; e = [e /= 1e9,  'G']
+      elsif e > 1e6; e = [e /= 1e6,  'M']
+      elsif e > 1e3; e = [e /= 1e3,  'K']
+      end
+    end
     colorize(schema, fmt % e, e)
   end.join)
 end
@@ -306,6 +314,7 @@ loop do
   stat_print("netirqs", :rate,   :irqnet)
   stat_print("stalls%", :stalls, RESOURCE_STALLS_ANY, CPU_CLK_UNHALTED_CORE, 100)
   stat_print("CPI_wb",  :cpi,    CPU_CLK_UNHALTED_CORE, INST_RETIRED_ANY)
+  stat_print("instrs",  :xrate,  INST_RETIRED_ANY)
 
   sleep @interval
 end
