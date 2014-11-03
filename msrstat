@@ -6,6 +6,7 @@
 require 'getoptlong'
 
 @interval = 5
+@color = true
 
 def check_user_perms
   if Process.uid != 0 &&
@@ -18,6 +19,7 @@ end
 
 GetoptLong.new(
       ["--help",     "-h", GetoptLong::NO_ARGUMENT],
+      ["--nocolor",  "-c", GetoptLong::NO_ARGUMENT],
 ).each do |opt, arg|
     case opt
     when '--help'
@@ -29,6 +31,8 @@ GetoptLong.new(
       puts "  CPI_wb   Cycles Per Instruction while busy: CPU_CLK_UNHALTED.CORE / INST_RETIRED.ANY"
       check_user_perms
       exit 0
+    when '--nocolor'
+      @color = false
     end
 end
 if ARGV[0].to_i > 0
@@ -180,26 +184,61 @@ class Array
   end
 end
 
-@msr = Hash.new {|h,k| h[k] = Hash.new}
-# read msr into array with automatic history value
-def rdmsra(addr, ts = nil)
-  newvals = rdmsr(addr)
-  oldvals = @msr[addr][:o] = @msr[addr][:n]
-  @msr[addr][:n] = newvals
-  @msr[addr][:to] = @msr[addr][:tn]
-  @msr[addr][:tn] = @now
-  if @msr[addr][:to]
-    @msr[addr][:td] = @msr[addr][:tn] - @msr[addr][:to]
-    @msr[addr][:r] = newvals.csub(oldvals, @pmc_max)
+@cs = Hash.new {|h,k| h[k] = Hash.new}
+def stat_rotate(key, newvals, shift = 0)
+  oldvals = @cs[key][:o] = @cs[key][:n]
+  @cs[key][:n] = newvals
+  if oldvals
+    @cs[key][:r] = newvals.csub(oldvals, shift)
   end
 end
-def msrdiv(a, b)
-  @msr[a][:r].div(@msr[b][:r])
+def stat_div(a, b)
+  @cs[a][:r].div(@cs[b][:r])
 end
-def msr_print(t, a, b, m = 1)
-  d = msrdiv(a, b)
+# colorize hard
+def colorize(schema, t, val)
+  u = c = nil
+  case schema
+  when :busy
+    c = "\e[1;31m" if val > 90
+  when :freq
+    c = "\e[1;34m" if val < 90
+  when :stalls
+    c = "\e[1;31m" if val > 50
+  end if @color
+  u = "\e[m" if c
+  "#{c}#{t}#{u}"
+end
+
+def stat_print(t, col, a, b, m = 1)
+  d = stat_div(a, b)
   d = d.mul(m) if m != 1
-  puts ("%-7s" % t) + d.map {|e| " %6.2f" % e}.join
+  puts ("%-7s" % t) + (d.map do |e|
+    colorize(col, " %6.2f" % e, e)
+  end.join)
+end
+
+# read msr into array with automatic history value
+def rdmsra(addr)
+  stat_rotate(addr, rdmsr(addr), @pmc_max)
+end
+
+def proc_stat
+  busy = []
+  total = []
+  lines = IO.readlines("/proc/stat").grep(/^cpu\d+ /)
+  lines.each do |li|
+    c, *d = li.split(" ")
+    c = c[/\d+/].to_i
+    # user, nice, sys, idle, iowait, irq, sirq, etc...
+    d = d.map {|e| e.to_i}
+    idle = d[3] + d[4] # idle + iowait
+    sum = d.reduce(:+)
+    total[c] = sum
+    busy[c] = sum - idle
+  end
+  stat_rotate(:busy, busy)
+  stat_rotate(:total, total)
 end
 
 # program perf counters
@@ -213,6 +252,7 @@ RESOURCE_STALLS_ANY     = IA32_PMC0
 begin
 loop do
   @now = Time.now
+  proc_stat
   rdmsra(IA32_APERF)
   rdmsra(IA32_MPERF)
   rdmsra(IA32_TIME_STAMP_COUNTER)
@@ -227,10 +267,11 @@ loop do
 
   puts
   puts @now.strftime('-%H:%M- ') + (0...nrcpu).to_a.map {|e| " cpu%-3d" % e}.join
-  msr_print("freq%", IA32_APERF, IA32_MPERF, 100)
-  msr_print("busy%", CPU_CLK_UNHALTED_CORE, IA32_TIME_STAMP_COUNTER, 100)
-  msr_print("CPI_wb", CPU_CLK_UNHALTED_CORE, INST_RETIRED_ANY)
-  msr_print("stalls%", RESOURCE_STALLS_ANY, CPU_CLK_UNHALTED_CORE, 100)
+  stat_print("freq%",   :freq,   IA32_APERF, IA32_MPERF, 100)
+  stat_print("busy%",   :busy,   CPU_CLK_UNHALTED_CORE, IA32_TIME_STAMP_COUNTER, 100)
+  stat_print("osbusy%", :busy,   :busy, :total, 100)
+  stat_print("stalls%", :stalls, RESOURCE_STALLS_ANY, CPU_CLK_UNHALTED_CORE, 100)
+  stat_print("CPI_wb",  :cpi,    CPU_CLK_UNHALTED_CORE, INST_RETIRED_ANY)
 
   sleep @interval
 end
